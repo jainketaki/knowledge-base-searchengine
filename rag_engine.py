@@ -1,10 +1,12 @@
 """
 Core RAG engine: PDF extraction, chunking, embedding, search, summarization.
 Designed for offline use with local models saved under `models/` (optional).
+Fixed quiz generation logic to work properly.
 """
 from typing import List, Tuple
 import os
 import re
+import random
 
 from PyPDF2 import PdfReader
 import numpy as np
@@ -26,10 +28,16 @@ def extract_text_from_pdf(path: str) -> str:
     for page in reader.pages:
         try:
             txt = page.extract_text()
+            if txt:
+                # Basic cleaning of PDF extraction artifacts
+                # Fix common issues where spaces are missing between words
+                txt = re.sub(r'([a-z])([A-Z])', r'\1 \2', txt)  # camelCase to proper spacing
+                txt = re.sub(r'([.!?])([A-Za-z])', r'\1 \2', txt)  # Punctuation spacing
+                txt = re.sub(r'([a-zA-Z])(\d)', r'\1 \2', txt)  # Letter-number spacing
+                txt = re.sub(r'(\d)([a-zA-Z])', r'\1 \2', txt)  # Number-letter spacing
+                texts.append(txt)
         except Exception:
-            txt = None
-        if txt:
-            texts.append(txt)
+            continue
     return "\n".join(texts)
 
 
@@ -132,11 +140,66 @@ class RAGEngine:
         return name
 
     def _clean_text(self, text: str) -> str:
-        # Replace multiple spaces/newlines with a single space, fix spacing after punctuation
+        # First, handle common PDF extraction issues
+        # Fix missing spaces between words that got concatenated
+        text = re.sub(r'([a-z])([A-Z])', r'\1 \2', text)  # Add space between lowercase and uppercase
+        text = re.sub(r'([a-zA-Z])(\d)', r'\1 \2', text)  # Add space between letters and numbers
+        text = re.sub(r'(\d)([a-zA-Z])', r'\1 \2', text)  # Add space between numbers and letters
+        text = re.sub(r'([.!?])([A-Za-z])', r'\1 \2', text)  # Ensure space after punctuation
+        text = re.sub(r'([a-z])([.!?])', r'\1 \2', text)  # Space before punctuation if missing
+        
+        # Handle common PDF artifacts
+        text = re.sub(r'([a-z])(\()', r'\1 \2', text)  # Space before opening parenthesis
+        text = re.sub(r'(\))([a-zA-Z])', r'\1 \2', text)  # Space after closing parenthesis
+        text = re.sub(r'([a-z])(,)', r'\1\2', text)  # Keep comma attached to word
+        text = re.sub(r'(,)([a-zA-Z])', r'\1 \2', text)  # Space after comma
+        
+        # Replace multiple spaces/newlines with a single space
         text = re.sub(r'[ \t\r\f\v]+', ' ', text)
         text = re.sub(r'\n+', ' ', text)
-        text = re.sub(r'([.!?])([A-Za-z])', r'\1 \2', text)  # Ensure space after punctuation
+        
+        # Fix common word concatenations
+        text = re.sub(r'([a-z])(the|and|or|in|on|at|to|for|of|with|by)', r'\1 \2', text)
+        text = re.sub(r'(the|and|or|in|on|at|to|for|of|with|by)([A-Z][a-z])', r'\1 \2', text)
+        
         return text.strip()
+
+    def _final_text_cleanup(self, text: str) -> str:
+        """Final cleanup pass to ensure proper spacing and readability."""
+        if not text:
+            return text
+            
+        # Fix common spacing issues
+        text = re.sub(r'\s+', ' ', text)  # Multiple spaces to single space
+        text = re.sub(r'\s*([.!?])\s*', r'\1 ', text)  # Proper spacing around sentence endings
+        text = re.sub(r'\s*,\s*', r', ', text)  # Proper spacing around commas
+        text = re.sub(r'\s*;\s*', r'; ', text)  # Proper spacing around semicolons
+        text = re.sub(r'\s*:\s*', r': ', text)  # Proper spacing around colons
+        
+        # Fix parentheses spacing
+        text = re.sub(r'\s*\(\s*', r' (', text)
+        text = re.sub(r'\s*\)\s*', r') ', text)
+        
+        # Fix quotation marks
+        text = re.sub(r'\s*"\s*', r' "', text)
+        text = re.sub(r'"\s*', r'" ', text)
+        
+        # Remove extra spaces at the beginning and end
+        text = text.strip()
+        
+        # Ensure sentences start with capital letters
+        sentences = re.split(r'([.!?]\s+)', text)
+        cleaned_sentences = []
+        for i, sentence in enumerate(sentences):
+            if i % 2 == 0 and sentence.strip():  # Actual sentence content
+                sentence = sentence.strip()
+                if sentence and sentence[0].islower():
+                    sentence = sentence[0].upper() + sentence[1:]
+                cleaned_sentences.append(sentence)
+            else:
+                cleaned_sentences.append(sentence)
+        
+        return ''.join(cleaned_sentences).strip()
 
     def ingest_pdf(self, pdf_path: str) -> int:
         text = extract_text_from_pdf(pdf_path)
@@ -156,7 +219,7 @@ class RAGEngine:
         self.embeddings = embeddings
         return len(chunks)
 
-    def query(self, question: str, top_k: int = 3) -> Tuple[str, List[Tuple[int, float, str]]]:
+    def query(self, question: str, top_k: int = 5) -> Tuple[str, List[Tuple[int, float, str]]]:
         if not self.chunks or len(self.chunks) == 0:
             raise ValueError("No document ingested. Please upload a PDF first.")
         q_emb = self.embedder.encode([question], convert_to_numpy=True)
@@ -169,29 +232,118 @@ class RAGEngine:
 
         # Combine top chunks into context
         context = "\n\n".join([c for (_, _, c) in top_chunks])
-        # Prepend the question as a prompt for the summarizer
-        prompt = f"Question: {question}\nContext: {context}"
-        # Truncate context to a reasonable size for CPU summarizers
-        if len(prompt) > 4000:
-            prompt = prompt[:4000]
-        # Summarize context with safe parameters for CPU
-        try:
-            result = self.summarizer(prompt,
-                                   max_length=180,
-                                   min_length=50,
-                                   do_sample=False,
-                                   num_beams=1,
-                                   temperature=1.0)
-            summary = result[0]["summary_text"].strip()
-            summary = self._clean_text(summary)
-        except Exception as e:
-            print(f"Summarization error: {str(e)}")
-            words = context.split()[:180]
-            summary = " ".join(words) + "..."
-        # Fallback: if summary is too generic or empty, return the most relevant chunk
-        if not summary or len(summary.split()) < 5 or summary.lower().startswith("question: "):
-            summary = self._clean_text(top_chunks[0][2][:500] + ("..." if len(top_chunks[0][2]) > 500 else ""))
+        
+        # Create a comprehensive summary using multiple approaches
+        summary = self._create_comprehensive_summary(context, question)
+        
         return summary, top_chunks
+
+    def _create_comprehensive_summary(self, context: str, question: str = "") -> str:
+        """Create a comprehensive summary using multiple techniques."""
+        # Clean the context first to fix spacing issues
+        context = self._clean_text(context)
+        
+        # Method 1: Try using the summarizer with better parameters
+        summary_parts = []
+        
+        # Split context into manageable chunks for the summarizer
+        context_chunks = []
+        words = context.split()
+        chunk_size = 800  # Larger chunks for better context
+        
+        for i in range(0, len(words), chunk_size):
+            chunk = " ".join(words[i:i + chunk_size])
+            context_chunks.append(chunk)
+        
+        # Summarize each chunk
+        for i, chunk in enumerate(context_chunks[:3]):  # Limit to 3 chunks to avoid too much processing
+            try:
+                if question:
+                    prompt = f"Summarize the following text in relation to this question: {question}\n\nText: {chunk}"
+                else:
+                    prompt = f"Provide a detailed summary of the following text:\n\n{chunk}"
+                
+                result = self.summarizer(prompt,
+                                       max_length=250,  # Increased max length
+                                       min_length=80,   # Increased min length
+                                       do_sample=False,
+                                       num_beams=2,     # Better quality with more beams
+                                       temperature=1.0)
+                chunk_summary = result[0]["summary_text"].strip()
+                chunk_summary = self._clean_text(chunk_summary)
+                
+                # Filter out poor quality summaries
+                if (chunk_summary and 
+                    len(chunk_summary.split()) >= 15 and 
+                    not chunk_summary.lower().startswith("question:") and
+                    not chunk_summary.lower().startswith("summarize") and
+                    not chunk_summary.lower().startswith("provide")):
+                    summary_parts.append(chunk_summary)
+                    
+            except Exception as e:
+                print(f"Summarization error for chunk {i}: {str(e)}")
+                continue
+        
+        # Method 2: If summarizer fails or produces poor results, use extractive approach
+        if not summary_parts or sum(len(part.split()) for part in summary_parts) < 50:
+            summary_parts = self._extractive_summary(context, target_sentences=8)
+        
+        # Combine and clean up the summary
+        if summary_parts:
+            final_summary = " ".join(summary_parts)
+            final_summary = self._clean_text(final_summary)
+            
+            # Ensure minimum length
+            if len(final_summary.split()) < 30:
+                # Add more context if summary is too short
+                additional_context = self._extractive_summary(context, target_sentences=5)
+                final_summary += " " + " ".join(additional_context)
+                final_summary = self._clean_text(final_summary)
+        else:
+            # Final fallback: use the first portion of context
+            context_clean = self._clean_text(context)
+            final_summary = context_clean[:1000] + ("..." if len(context_clean) > 1000 else "")
+        
+        # Final cleaning pass to ensure proper spacing
+        final_summary = self._final_text_cleanup(final_summary)
+        return final_summary
+
+    def _extractive_summary(self, text: str, target_sentences: int = 6) -> List[str]:
+        """Create an extractive summary by selecting the most important sentences."""
+        # Clean the text first
+        text = self._clean_text(text)
+        
+        # Split into sentences
+        sentences = re.split(r'(?<=[.!?])\s+', text)
+        
+        # Filter and score sentences
+        scored_sentences = []
+        for sentence in sentences:
+            sentence = sentence.strip()
+            if len(sentence.split()) >= 8:  # Only meaningful sentences
+                # Simple scoring based on length and content
+                score = len(sentence.split())
+                
+                # Boost score for sentences with important indicators
+                important_words = ['important', 'key', 'main', 'primary', 'significant', 
+                                 'essential', 'critical', 'fundamental', 'major', 'central']
+                for word in important_words:
+                    if word in sentence.lower():
+                        score += 10
+                
+                # Boost score for sentences with numbers/statistics
+                if re.search(r'\d+', sentence):
+                    score += 5
+                
+                # Clean the sentence before adding
+                clean_sentence = self._final_text_cleanup(sentence)
+                scored_sentences.append((score, clean_sentence))
+        
+        # Sort by score and take top sentences
+        scored_sentences.sort(key=lambda x: x[0], reverse=True)
+        top_sentences = [sent for score, sent in scored_sentences[:target_sentences]]
+        
+        return top_sentences
 
     def extract_topics(self, top_n: int = 5) -> list:
         if not self.chunks or len(self.chunks) == 0:
@@ -208,29 +360,269 @@ class RAGEngine:
         topics = result[0]["summary_text"].strip()
         return topics.split("\n")
 
+    def _extract_key_sentences(self, text: str, min_words: int = 8) -> List[str]:
+        """Extract meaningful sentences that could be turned into questions."""
+        # Split into sentences
+        sentences = re.split(r'(?<=[.!?])\s+', text)
+        key_sentences = []
+        
+        for sentence in sentences:
+            sentence = sentence.strip()
+            # Filter out short sentences, headings, and low-content sentences
+            if (len(sentence.split()) >= min_words and 
+                len(sentence.split()) <= 50 and  # Not too long either
+                not sentence.isupper() and  # Skip ALL CAPS headings
+                not re.match(r'^\d+\.?\s*$', sentence) and  # Skip numbered items
+                not sentence.startswith('Figure') and
+                not sentence.startswith('Table') and
+                not sentence.startswith('Page') and
+                not sentence.startswith('Chapter') and
+                '.' in sentence and  # Ensure it's a complete sentence
+                not sentence.startswith('www.') and  # Skip URLs
+                not sentence.startswith('http')):  # Skip URLs
+                key_sentences.append(sentence)
+        
+        return key_sentences
+
+    def _create_question_from_sentence(self, sentence: str) -> Tuple[str, str]:
+        """Convert a sentence into a question-answer pair with improved patterns."""
+        sentence = sentence.strip()
+        
+        # Pattern 1: "X is Y" -> "What is X?"
+        match = re.search(r'([A-Z][^.]*?)\s+(?:is|are|was|were)\s+([^.]+)', sentence)
+        if match:
+            subject = match.group(1).strip()
+            predicate = match.group(2).strip()
+            if len(subject.split()) <= 6 and len(subject.split()) >= 1:
+                question = f"What is {subject}?"
+                answer = f"{subject} is {predicate}."
+                return question, answer
+        
+        # Pattern 2: "X involves/includes/contains Y" -> "What does X involve/include?"
+        match = re.search(r'([A-Z][^.]*?)\s+(involves?|includes?|contains?|comprises?|consists?\s+of)\s+([^.]+)', sentence)
+        if match:
+            subject = match.group(1).strip()
+            verb = match.group(2).strip()
+            object_part = match.group(3).strip()
+            if len(subject.split()) <= 6:
+                question = f"What does {subject} {verb.lower()}?"
+                answer = f"{subject} {verb.lower()} {object_part}."
+                return question, answer
+        
+        # Pattern 3: "The purpose/goal/objective of X is Y" -> "What is the purpose of X?"
+        match = re.search(r'[Tt]he\s+(purpose|goal|objective|aim)\s+of\s+([^.]*?)\s+is\s+([^.]+)', sentence)
+        if match:
+            purpose_word = match.group(1)
+            subject = match.group(2).strip()
+            purpose = match.group(3).strip()
+            question = f"What is the {purpose_word} of {subject}?"
+            answer = f"The {purpose_word} of {subject} is {purpose}."
+            return question, answer
+        
+        # Pattern 4: "X can/should/must/will Y" -> "What can/should/must/will X do?"
+        match = re.search(r'([A-Z][^.]*?)\s+(can|should|must|will|may|might)\s+([^.]+)', sentence)
+        if match:
+            subject = match.group(1).strip()
+            modal = match.group(2).strip()
+            action = match.group(3).strip()
+            if len(subject.split()) <= 6:
+                question = f"What {modal} {subject} do?"
+                answer = f"{subject} {modal} {action}."
+                return question, answer
+        
+        # Pattern 5: Numbers and statistics
+        match = re.search(r'([^.]*?)\s+(?:is|are|was|were)\s+(\d+[%\w\s]*)', sentence)
+        if match:
+            context = match.group(1).strip()
+            number = match.group(2).strip()
+            if len(context.split()) <= 8:
+                question = f"What is {context}?"
+                answer = f"{context} is {number}."
+                return question, answer
+        
+        # Pattern 6: "X happens/occurs when Y" -> "When does X happen?"
+        match = re.search(r'([^.]*?)\s+(happens?|occurs?|takes?\s+place)\s+when\s+([^.]+)', sentence)
+        if match:
+            event = match.group(1).strip()
+            condition = match.group(3).strip()
+            question = f"When does {event} happen?"
+            answer = f"{event} happens when {condition}."
+            return question, answer
+        
+        # Pattern 7: "There are X types/kinds/categories of Y" -> "How many types of Y are there?"
+        match = re.search(r'[Tt]here\s+are\s+(\w+)\s+(types?|kinds?|categories?)\s+of\s+([^.]+)', sentence)
+        if match:
+            number = match.group(1)
+            category_word = match.group(2)
+            subject = match.group(3).strip()
+            question = f"How many {category_word} of {subject} are there?"
+            answer = f"There are {number} {category_word} of {subject}."
+            return question, answer
+        
+        # Pattern 8: "X allows/enables/helps Y" -> "What does X allow/enable/help?"
+        match = re.search(r'([A-Z][^.]*?)\s+(allows?|enables?|helps?)\s+([^.]+)', sentence)
+        if match:
+            subject = match.group(1).strip()
+            verb = match.group(2).strip()
+            object_part = match.group(3).strip()
+            if len(subject.split()) <= 6:
+                question = f"What does {subject} {verb.lower()}?"
+                answer = f"{subject} {verb.lower()} {object_part}."
+                return question, answer
+        
+        # Pattern 9: "X results in/leads to Y" -> "What does X result in?"
+        match = re.search(r'([A-Z][^.]*?)\s+(results?\s+in|leads?\s+to|causes?)\s+([^.]+)', sentence)
+        if match:
+            subject = match.group(1).strip()
+            verb = match.group(2).strip()
+            result = match.group(3).strip()
+            if len(subject.split()) <= 6:
+                question = f"What does {subject} {verb.lower()}?"
+                answer = f"{subject} {verb.lower()} {result}."
+                return question, answer
+        
+        # Pattern 10: Generic fallback for definition-like sentences
+        if len(sentence.split()) >= 10 and len(sentence.split()) <= 25:
+            # Try to extract the main subject (first few words before first verb)
+            words = sentence.split()
+            for i, word in enumerate(words[:7]):
+                if word.lower() in ['is', 'are', 'was', 'were', 'can', 'will', 'should', 'must', 'may', 'might', 'has', 'have']:
+                    subject = ' '.join(words[:i])
+                    if len(subject.split()) >= 2 and len(subject.split()) <= 6:
+                        question = f"What can you tell me about {subject}?"
+                        answer = sentence
+                        return question, answer
+                    break
+        
+        return None, None
+
     def generate_quiz(self, num_questions: int = 3) -> list:
+        """Generate quiz questions from the document content using rule-based approach."""
         if not self.chunks or len(self.chunks) == 0:
-            return []
-        context = " ".join(self.chunks)
-        # Limit context to avoid model truncation
-        context = context[:3000]
-        prompt = (
-            f"Create {num_questions} quiz questions and answers from the following document. "
-            "Format as: Q1: <question>\nA1: <answer>\nQ2: <question>\nA2: <answer>\nQ3: <question>\nA3: <answer>\n" + context
-        )
-        result = self.summarizer(prompt, max_length=220, min_length=60, do_sample=False)
-        qa_text = result[0]["summary_text"].strip()
-        # Parse Q/A pairs
+            return [("No Content", "Please upload a PDF document first to generate quiz questions.")]
+        
+        # Combine all chunks and clean the text
+        full_text = " ".join(self.chunks)
+        full_text = self._clean_text(full_text)
+        
+        # Extract key sentences with lower threshold for more variety
+        key_sentences = self._extract_key_sentences(full_text, min_words=6)
+        
+        if not key_sentences:
+            return [("No Suitable Content", "The document doesn't contain enough structured content to generate quiz questions.")]
+        
+        # Shuffle sentences to get variety
+        random.shuffle(key_sentences)
+        
+        # Generate questions from sentences
         qa_pairs = []
-        for match in re.finditer(r"Q\d+:\s*(.*?)\s*A\d+:\s*(.*?)(?=Q\d+:|$)", qa_text, re.DOTALL):
-            q, a = match.groups()
-            q = self._clean_text(q)
-            a = self._clean_text(a)
-            if q and a:
-                qa_pairs.append((q, a))
-        # Fallback: show raw output if parsing fails
-        if not qa_pairs:
-            qa_pairs = [("Quiz Output", self._clean_text(qa_text))]
+        used_sentences = set()
+        used_questions = set()
+        
+        # Try to generate questions from different parts of the document
+        max_attempts = min(len(key_sentences), num_questions * 10)  # Try more sentences
+        
+        for i, sentence in enumerate(key_sentences[:max_attempts]):
+            if len(qa_pairs) >= num_questions:
+                break
+                
+            if sentence in used_sentences:
+                continue
+                
+            question, answer = self._create_question_from_sentence(sentence)
+            
+            if question and answer and question not in used_questions:
+                # Clean both question and answer for proper spacing
+                question = self._final_text_cleanup(question)
+                answer = self._final_text_cleanup(answer)
+                
+                # Ensure question and answer are of good quality
+                if (len(question.split()) >= 4 and 
+                    len(answer.split()) >= 5 and
+                    len(answer.split()) <= 50):
+                    qa_pairs.append((question, answer))
+                    used_sentences.add(sentence)
+                    used_questions.add(question)
+        
+        # If we don't have enough questions, create topic-based questions
+        if len(qa_pairs) < num_questions:
+            remaining_needed = num_questions - len(qa_pairs)
+            topic_questions = self._generate_topic_questions(remaining_needed)
+            qa_pairs.extend(topic_questions)
+        
+        # If still not enough, create chunk-based questions
+        if len(qa_pairs) < num_questions:
+            remaining_needed = num_questions - len(qa_pairs)
+            chunk_questions = self._generate_chunk_questions(remaining_needed)
+            qa_pairs.extend(chunk_questions)
+        
+        return qa_pairs[:num_questions]
+
+    def _generate_topic_questions(self, num_needed: int) -> List[Tuple[str, str]]:
+        """Generate questions based on document topics."""
+        qa_pairs = []
+        topics = self.extract_topics(top_n=num_needed * 2)
+        
+        for topic in topics:
+            if len(qa_pairs) >= num_needed:
+                break
+                
+            if isinstance(topic, str) and len(topic.strip()) > 3:
+                topic_clean = topic.strip()
+                
+                # Find the best sentence containing this topic
+                best_sentence = None
+                best_score = 0
+                
+                for chunk in self.chunks:
+                    clean_chunk = self._clean_text(chunk)
+                    sentences = re.split(r'(?<=[.!?])\s+', clean_chunk)
+                    for sentence in sentences:
+                        if (topic_clean.lower() in sentence.lower() and 
+                            len(sentence.split()) >= 8 and 
+                            len(sentence.split()) <= 40):
+                            # Score based on sentence quality
+                            score = len(sentence.split()) + sentence.lower().count(topic_clean.lower()) * 5
+                            if score > best_score:
+                                best_score = score
+                                best_sentence = sentence
+                
+                if best_sentence:
+                    question = f"What does the document say about {topic_clean}?"
+                    answer = self._final_text_cleanup(best_sentence.strip())
+                    qa_pairs.append((question, answer))
+                    
+        return qa_pairs
+
+    def _generate_chunk_questions(self, num_needed: int) -> List[Tuple[str, str]]:
+        """Generate questions from important document chunks."""
+        qa_pairs = []
+        
+        # Sort chunks by length (assuming longer chunks have more content)
+        chunk_scores = [(i, len(chunk), chunk) for i, chunk in enumerate(self.chunks)]
+        chunk_scores.sort(key=lambda x: x[1], reverse=True)
+        
+        for i, (chunk_idx, length, chunk) in enumerate(chunk_scores[:num_needed]):
+            if len(qa_pairs) >= num_needed:
+                break
+                
+            # Clean the chunk first
+            clean_chunk = self._clean_text(chunk)
+            
+            # Create a general question about this section
+            question = f"What is discussed in section {i+1} of the document?"
+            
+            # Get the first few sentences as answer
+            sentences = re.split(r'(?<=[.!?])\s+', clean_chunk)
+            good_sentences = [s for s in sentences[:3] if len(s.split()) >= 5]
+            
+            if good_sentences:
+                answer = ". ".join(good_sentences[:2])
+                if len(answer) > 300:
+                    answer = answer[:297] + "..."
+                answer = self._final_text_cleanup(answer)
+                qa_pairs.append((question, answer))
+        
         return qa_pairs
 
 
