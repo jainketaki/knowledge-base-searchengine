@@ -153,6 +153,6 @@ MetricPerformanceRetrieval Time< 200ms averageTotal Response Time< 3 secondsDocu
          │   RETURN ANSWER        │
          │   WITH SOURCES         │
          └────────────────────────┘
-Made with love for Unthinkable.
+
 Author:
 Ketaki Jain
